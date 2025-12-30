@@ -1,0 +1,29 @@
+simulator:
+  host: "127.0.0.1"
+  port: 9000
+
+ui:
+  update_hz: 5          # GUI refresh rate (>=2Hz). 5Hz feels smooth.
+  plot_window_sec: 20   # rolling plot window
+
+sensors:
+  - name: "Temp_C"
+    low: 5
+    high: 45
+  - name: "Pressure_bar"
+    low: 0.5
+    high: 10.0
+  - name: "Vibration_mm_s"
+    low: 0.0
+    high: 15.0
+  - name: "Speed_rpm"
+    low: 500
+    high: 3500
+  - name: "Optical_count"
+    low: 0
+    high: 1200
+
+api:
+  host: "127.0.0.1"
+  port: 8000
+
