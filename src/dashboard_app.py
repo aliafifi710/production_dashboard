@@ -6,7 +6,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections import deque
-from typing import Dict, Deque, Optional
+from typing import Dict, Deque, Optional, Any, List
 
 import yaml
 from PySide6.QtCore import QTimer, Qt
@@ -27,7 +27,91 @@ from PySide6.QtWidgets import (
 
 import pyqtgraph as pg
 
+from fastapi import FastAPI
+import uvicorn
 
+
+# =========================
+# Remote API Shared State
+# =========================
+class SharedApiState:
+    """
+    Thread-safe shared state:
+      - GUI thread writes (latest sensors + alarms + system status)
+      - API thread reads snapshots and returns JSON
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._system_status: str = "CONNECTING"
+        self._sensors: Dict[str, Dict[str, Any]] = {}
+        self._alarms: List[Dict[str, Any]] = []
+
+    def update_sensor(self, name: str, snapshot: Dict[str, Any]) -> None:
+        with self._lock:
+            self._sensors[name] = dict(snapshot)
+
+    def set_system_status(self, status: str) -> None:
+        with self._lock:
+            self._system_status = status
+
+    def add_alarm(self, alarm: Dict[str, Any], cap: int = 500) -> None:
+        with self._lock:
+            self._alarms.append(dict(alarm))
+            if len(self._alarms) > cap:
+                self._alarms = self._alarms[-cap:]
+
+    def snapshot_sensors(self) -> Dict[str, Any]:
+        with self._lock:
+            sensors_list = [{"name": k, **v} for k, v in self._sensors.items()]
+            return {
+                "system_status": self._system_status,
+                "sensors": sensors_list,
+                "alarms_count": len(self._alarms),
+            }
+
+    def snapshot_alarms(self, last_n: int = 200) -> Dict[str, Any]:
+        with self._lock:
+            data = self._alarms[-last_n:]
+            return {"count": len(self._alarms), "alarms": list(data)}
+
+
+def create_api_app(state: SharedApiState) -> FastAPI:
+    app = FastAPI(title="Production Line Remote API", version="1.0")
+
+    @app.get("/api/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.get("/api/sensors")
+    def sensors():
+        return state.snapshot_sensors()
+
+    @app.get("/api/alarms")
+    def alarms():
+        return state.snapshot_alarms()
+
+    return app
+
+
+class ApiServerThread(threading.Thread):
+    """
+    Runs Uvicorn(FastAPI) in a background thread.
+    """
+    def __init__(self, app: FastAPI, host: str, port: int):
+        super().__init__(daemon=True)
+        self._config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        self._server = uvicorn.Server(self._config)
+
+    def run(self):
+        self._server.run()
+
+    def stop(self):
+        self._server.should_exit = True
+
+
+# =========================
+# Models
+# =========================
 @dataclass
 class SensorState:
     name: str
@@ -41,6 +125,9 @@ class SensorState:
     v_buf: Deque[float] = field(default_factory=lambda: deque(maxlen=600))
 
 
+# =========================
+# TCP Worker
+# =========================
 class SensorTCPWorker(threading.Thread):
     """Background thread reads TCP stream and pushes messages into a queue (no GUI updates)."""
     def __init__(self, host: str, port: int, out_queue: queue.Queue, stop_event: threading.Event):
@@ -77,18 +164,29 @@ class SensorTCPWorker(threading.Thread):
                 self.stop_event.wait(0.5)
 
 
+# =========================
+# GUI
+# =========================
 class MainWindow(QMainWindow):
     def __init__(self, config_path: str):
         super().__init__()
         self.setWindowTitle("Production Line Sensor Dashboard")
 
         cfg = self._load_config(config_path)
+
+        # Simulator connection
         self.host = cfg["simulator"]["host"]
         self.port = int(cfg["simulator"]["port"])
+
+        # GUI / plot settings
         self.update_hz = float(cfg["ui"]["update_hz"])
         self.plot_window_sec = float(cfg["ui"]["plot_window_sec"])
 
-        # ✅ Force stable order from config so all 5 always exist in UI
+        # API settings (remote access)
+        self.api_host = cfg.get("api", {}).get("host", "127.0.0.1")
+        self.api_port = int(cfg.get("api", {}).get("port", 8000))
+
+        # Force stable order from config (all 5 always appear)
         self.sensor_names = [s["name"] for s in cfg["sensors"]]
 
         self.sensors: Dict[str, SensorState] = {}
@@ -98,15 +196,25 @@ class MainWindow(QMainWindow):
                 raise ValueError(f"Duplicate sensor name in config: {name}")
             self.sensors[name] = SensorState(name=name, low=float(s["low"]), high=float(s["high"]))
 
+        # Thread-safe queue (worker -> GUI)
         self.msg_queue: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
 
+        # Start TCP worker
         self.worker = SensorTCPWorker(self.host, self.port, self.msg_queue, self.stop_event)
         self.worker.start()
 
+        # Start API server
+        self.api_state = SharedApiState()
+        api_app = create_api_app(self.api_state)
+        self.api_thread = ApiServerThread(api_app, self.api_host, self.api_port)
+        self.api_thread.start()
+
+        # Build UI
         self._build_ui()
         self._apply_dark_theme()
 
+        # Timer for GUI updates (>=2Hz)
         interval_ms = int(1000 / max(self.update_hz, 2.0))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_timer_tick)
@@ -114,6 +222,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.stop_event.set()
+        if hasattr(self, "api_thread"):
+            self.api_thread.stop()
         event.accept()
 
     def _load_config(self, path: str) -> dict:
@@ -152,14 +262,14 @@ class MainWindow(QMainWindow):
         dash_layout = QVBoxLayout(dash)
 
         self.global_status = QLabel("System: CONNECTING...")
+
         self.global_status.setAlignment(Qt.AlignCenter)
         self.global_status.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px;")
         dash_layout.addWidget(self.global_status)
 
-        # Split: table left, plots right (so all 5 plots visible without scrolling)
         splitter = QSplitter(Qt.Horizontal)
 
-        # Table
+        # Table (left)
         self.table = QTableWidget(len(self.sensor_names), 4)
         self.table.setHorizontalHeaderLabels(["Sensor", "Latest Value", "Timestamp", "Status"])
         self.table.verticalHeader().setVisible(False)
@@ -184,7 +294,7 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self.table)
 
-        # Plots (3x2 grid, only 5 used)
+        # Plots (right) 3x2 grid (5 used) => no scrolling
         plots_widget = QWidget()
         plots_grid = QGridLayout(plots_widget)
         plots_grid.setHorizontalSpacing(10)
@@ -197,7 +307,7 @@ class MainWindow(QMainWindow):
 
         for i, name in enumerate(self.sensor_names):
             pw = pg.PlotWidget()
-            pw.setMinimumHeight(150)  # fits in 3 rows on most screens
+            pw.setMinimumHeight(150)
             pw.setTitle(name)
 
             pw.setBackground("#1e1e1e")
@@ -206,7 +316,6 @@ class MainWindow(QMainWindow):
                 pw.getAxis(ax).setTextPen("w")
 
             pw.showGrid(x=True, y=True, alpha=0.2)
-
             curve = pw.plot([], [])
             self.plot_widgets[name] = pw
             self.plot_curves[name] = curve
@@ -216,11 +325,9 @@ class MainWindow(QMainWindow):
             plots_grid.addWidget(pw, r, c)
 
         splitter.addWidget(plots_widget)
-
-        # Give the plots more width than the table by default
         splitter.setSizes([450, 750])
-
         dash_layout.addWidget(splitter)
+
         self.tabs.addTab(dash, "Dashboard")
 
         # -------- Alarm Log tab --------
@@ -255,6 +362,7 @@ class MainWindow(QMainWindow):
             item.setForeground(QBrush(QColor(color_hex)))
 
     def _append_alarm(self, ts: str, sensor: str, value: float, alarm_type: str):
+        # GUI alarm log
         r = self.alarm_table.rowCount()
         self.alarm_table.insertRow(r)
         self.alarm_table.setItem(r, 0, QTableWidgetItem(ts))
@@ -266,10 +374,18 @@ class MainWindow(QMainWindow):
         if self.alarm_table.rowCount() > 500:
             self.alarm_table.removeRow(0)
 
+        # API alarm history
+        self.api_state.add_alarm({
+            "time": ts,
+            "sensor": sensor,
+            "value": value,
+            "type": alarm_type,
+        })
+
     def _on_timer_tick(self):
         now_epoch = datetime.now().timestamp()
 
-        # Drain messages
+        # Drain messages from worker
         while True:
             try:
                 msg = self.msg_queue.get_nowait()
@@ -303,7 +419,7 @@ class MainWindow(QMainWindow):
             else:
                 st.in_alarm = False
 
-        # Refresh UI
+        # Refresh UI + update API snapshots
         any_alarm = False
         any_fault = False
         any_ok_data = False
@@ -328,17 +444,16 @@ class MainWindow(QMainWindow):
             if is_alarm_now:
                 any_alarm = True
 
-            # ✅ Requirement: "Highlight the sensor row in red"
-            # We use a clear red background for the whole row.
+            # Requirement: highlight row in RED when outside limits
             if is_alarm_now:
-                self._paint_row(row, bg="#ff0000", fg="#ffffff")  # RED row
+                self._paint_row(row, bg="#ff0000", fg="#ffffff")
                 self._set_status_text_color(row, "#ffffff")
             elif st.status == "FAULT":
                 self._paint_row(row, bg="#2b2b2b", fg="#ffffff")
-                self._set_status_text_color(row, "#ffd166")  # warning
+                self._set_status_text_color(row, "#ffd166")  # yellow warning text
             elif st.status == "OK":
                 self._paint_row(row, bg="#2b2b2b", fg="#ffffff")
-                self._set_status_text_color(row, "#4ade80")  # ok
+                self._set_status_text_color(row, "#4ade80")  # green OK text
             else:
                 self._paint_row(row, bg="#2b2b2b", fg="#ffffff")
                 self._set_status_text_color(row, "#ffffff")
@@ -354,26 +469,39 @@ class MainWindow(QMainWindow):
                     self.plot_curves[name].setData(fx, fy)
                     self.plot_widgets[name].setXRange(-self.plot_window_sec, 0, padding=0.01)
 
-        # Global status
+            # API per-sensor snapshot
+            self.api_state.update_sensor(name, {
+                "value": st.value,
+                "ts": st.ts,
+                "status": st.status,
+                "low": st.low,
+                "high": st.high,
+            })
+
+        # Global status (GUI + API)
         if any_alarm:
             self.global_status.setText("System: ALARM")
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ff6b6b;")
+            self.api_state.set_system_status("ALARM")
         elif any_fault:
             self.global_status.setText("System: WARNING (Faulty Sensor)")
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ffd166;")
+            self.api_state.set_system_status("WARNING")
         elif any_ok_data:
             self.global_status.setText("System: OK")
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#4ade80;")
+            self.api_state.set_system_status("OK")
         else:
             self.global_status.setText("System: CONNECTING...")
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ffffff;")
+            self.api_state.set_system_status("CONNECTING")
+
 
 
 def main():
     config_path = "configs/config.yaml"
     app = QApplication(sys.argv)
     win = MainWindow(config_path)
-    # Wide enough to show table + 2 plot columns without scrolling
     win.resize(1300, 820)
     win.show()
     sys.exit(app.exec())
