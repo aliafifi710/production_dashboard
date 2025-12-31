@@ -35,11 +35,6 @@ import uvicorn
 # Remote API Shared State
 # =========================
 class SharedApiState:
-    """
-    Thread-safe shared state:
-      - GUI thread writes (latest sensors + alarms + system status)
-      - API thread reads snapshots and returns JSON
-    """
     def __init__(self):
         self._lock = threading.Lock()
         self._system_status: str = "CONNECTING"
@@ -94,9 +89,6 @@ def create_api_app(state: SharedApiState) -> FastAPI:
 
 
 class ApiServerThread(threading.Thread):
-    """
-    Runs Uvicorn(FastAPI) in a background thread.
-    """
     def __init__(self, app: FastAPI, host: str, port: int):
         super().__init__(daemon=True)
         self._config = uvicorn.Config(app, host=host, port=port, log_level="warning")
@@ -119,34 +111,58 @@ class SensorState:
     high: float
     value: Optional[float] = None
     ts: str = "-"
-    status: str = "N/A"     # OK / FAULT / N/A
+    status: str = "N/A"  # OK / FAULT / N/A
     in_alarm: bool = False
     t_buf: Deque[float] = field(default_factory=lambda: deque(maxlen=600))
     v_buf: Deque[float] = field(default_factory=lambda: deque(maxlen=600))
 
 
 # =========================
-# TCP Worker
+# TCP SERVER Worker (Dashboard listens)
 # =========================
-class SensorTCPWorker(threading.Thread):
-    """Background thread reads TCP stream and pushes messages into a queue (no GUI updates)."""
-    def __init__(self, host: str, port: int, out_queue: queue.Queue, stop_event: threading.Event):
+class DashboardTCPServerWorker(threading.Thread):
+    """
+    Dashboard is the TCP server:
+    - bind() + listen()
+    - accept() a simulator connection
+    - read newline-delimited JSON
+    - push parsed dicts into a queue
+    Never touches GUI.
+    """
+    def __init__(self, bind_host: str, bind_port: int, out_queue: queue.Queue, stop_event: threading.Event):
         super().__init__(daemon=True)
-        self.host = host
-        self.port = port
+        self.bind_host = bind_host
+        self.bind_port = bind_port
         self.out_queue = out_queue
         self.stop_event = stop_event
 
     def run(self):
-        while not self.stop_event.is_set():
-            try:
-                with socket.create_connection((self.host, self.port), timeout=3) as sock:
-                    sock.settimeout(1.0)
-                    f = sock.makefile("r", encoding="utf-8", newline="\n")
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-                    for line in f:
-                        if self.stop_event.is_set():
-                            break
+        try:
+            server.bind((self.bind_host, self.bind_port))
+            server.listen(1)
+            server.settimeout(0.5)  # so we can check stop_event periodically
+            print(f"[DASH] Listening for simulator on {self.bind_host}:{self.bind_port}")
+
+            while not self.stop_event.is_set():
+                try:
+                    conn, addr = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                print(f"[DASH] Simulator connected from {addr}")
+                with conn:
+                    conn.settimeout(1.0)
+                    f = conn.makefile("r", encoding="utf-8", newline="\n")
+
+                    while not self.stop_event.is_set():
+                        line = f.readline()
+                        if not line:
+                            break  # disconnect
                         line = line.strip()
                         if not line:
                             continue
@@ -160,8 +176,13 @@ class SensorTCPWorker(threading.Thread):
                         except json.JSONDecodeError:
                             continue
 
-            except (ConnectionRefusedError, TimeoutError, OSError):
-                self.stop_event.wait(0.5)
+                print("[DASH] Simulator disconnected. Waiting for reconnect...")
+
+        finally:
+            try:
+                server.close()
+            except Exception:
+                pass
 
 
 # =========================
@@ -174,11 +195,10 @@ class MainWindow(QMainWindow):
 
         cfg = self._load_config(config_path)
 
-        # Simulator connection
-        self.host = cfg["simulator"]["host"]
-        self.port = int(cfg["simulator"]["port"])
+        # NOW: these mean dashboard bind host/port (server)
+        self.bind_host = cfg["simulator"]["host"]
+        self.bind_port = int(cfg["simulator"]["port"])
 
-        # GUI / plot settings
         self.update_hz = float(cfg["ui"]["update_hz"])
         self.plot_window_sec = float(cfg["ui"]["plot_window_sec"])
 
@@ -186,7 +206,7 @@ class MainWindow(QMainWindow):
         self.api_host = cfg.get("api", {}).get("host", "127.0.0.1")
         self.api_port = int(cfg.get("api", {}).get("port", 8000))
 
-        # Force stable order from config (all 5 always appear)
+        # Stable order from config
         self.sensor_names = [s["name"] for s in cfg["sensors"]]
 
         self.sensors: Dict[str, SensorState] = {}
@@ -200,8 +220,8 @@ class MainWindow(QMainWindow):
         self.msg_queue: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
 
-        # Start TCP worker
-        self.worker = SensorTCPWorker(self.host, self.port, self.msg_queue, self.stop_event)
+        # Start TCP server worker
+        self.worker = DashboardTCPServerWorker(self.bind_host, self.bind_port, self.msg_queue, self.stop_event)
         self.worker.start()
 
         # Start API server
@@ -214,7 +234,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_dark_theme()
 
-        # Timer for GUI updates (>=2Hz)
+        # GUI update timer
         interval_ms = int(1000 / max(self.update_hz, 2.0))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_timer_tick)
@@ -257,19 +277,18 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         root_layout.addWidget(self.tabs)
 
-        # -------- Dashboard tab --------
+        # Dashboard tab
         dash = QWidget()
         dash_layout = QVBoxLayout(dash)
 
         self.global_status = QLabel("System: CONNECTING...")
-
         self.global_status.setAlignment(Qt.AlignCenter)
         self.global_status.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px;")
         dash_layout.addWidget(self.global_status)
 
         splitter = QSplitter(Qt.Horizontal)
 
-        # Table (left)
+        # Table
         self.table = QTableWidget(len(self.sensor_names), 4)
         self.table.setHorizontalHeaderLabels(["Sensor", "Latest Value", "Timestamp", "Status"])
         self.table.verticalHeader().setVisible(False)
@@ -294,7 +313,7 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self.table)
 
-        # Plots (right) 3x2 grid (5 used) => no scrolling
+        # Plots (3x2 grid => 5 visible)
         plots_widget = QWidget()
         plots_grid = QGridLayout(plots_widget)
         plots_grid.setHorizontalSpacing(10)
@@ -309,7 +328,6 @@ class MainWindow(QMainWindow):
             pw = pg.PlotWidget()
             pw.setMinimumHeight(150)
             pw.setTitle(name)
-
             pw.setBackground("#1e1e1e")
             for ax in ("bottom", "left"):
                 pw.getAxis(ax).setPen("w")
@@ -330,7 +348,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(dash, "Dashboard")
 
-        # -------- Alarm Log tab --------
+        # Alarm Log tab
         alarms = QWidget()
         alarms_layout = QVBoxLayout(alarms)
 
@@ -343,7 +361,6 @@ class MainWindow(QMainWindow):
         alarms_layout.addWidget(self.alarm_table)
 
         self.tabs.addTab(alarms, "Alarm Log")
-
         self.setCentralWidget(root)
 
     def _paint_row(self, row: int, bg: str, fg: str):
@@ -362,7 +379,6 @@ class MainWindow(QMainWindow):
             item.setForeground(QBrush(QColor(color_hex)))
 
     def _append_alarm(self, ts: str, sensor: str, value: float, alarm_type: str):
-        # GUI alarm log
         r = self.alarm_table.rowCount()
         self.alarm_table.insertRow(r)
         self.alarm_table.setItem(r, 0, QTableWidgetItem(ts))
@@ -375,17 +391,12 @@ class MainWindow(QMainWindow):
             self.alarm_table.removeRow(0)
 
         # API alarm history
-        self.api_state.add_alarm({
-            "time": ts,
-            "sensor": sensor,
-            "value": value,
-            "type": alarm_type,
-        })
+        self.api_state.add_alarm({"time": ts, "sensor": sensor, "value": value, "type": alarm_type})
 
     def _on_timer_tick(self):
         now_epoch = datetime.now().timestamp()
 
-        # Drain messages from worker
+        # Drain messages
         while True:
             try:
                 msg = self.msg_queue.get_nowait()
@@ -394,7 +405,7 @@ class MainWindow(QMainWindow):
 
             name = msg["sensor"]
             if name not in self.sensors:
-                continue  # name mismatch => fix config/simulator names
+                continue
 
             st = self.sensors[name]
             st.value = float(msg["value"])
@@ -419,7 +430,7 @@ class MainWindow(QMainWindow):
             else:
                 st.in_alarm = False
 
-        # Refresh UI + update API snapshots
+        # Refresh UI + API snapshots
         any_alarm = False
         any_fault = False
         any_ok_data = False
@@ -444,9 +455,8 @@ class MainWindow(QMainWindow):
             if is_alarm_now:
                 any_alarm = True
 
-            # Requirement: highlight row in RED when outside limits
             if is_alarm_now:
-                self._paint_row(row, bg="#ff0000", fg="#ffffff")
+                self._paint_row(row, bg="#ff0000", fg="#ffffff")  # RED row
                 self._set_status_text_color(row, "#ffffff")
             elif st.status == "FAULT":
                 self._paint_row(row, bg="#2b2b2b", fg="#ffffff")
@@ -469,7 +479,7 @@ class MainWindow(QMainWindow):
                     self.plot_curves[name].setData(fx, fy)
                     self.plot_widgets[name].setXRange(-self.plot_window_sec, 0, padding=0.01)
 
-            # API per-sensor snapshot
+            # API snapshot
             self.api_state.update_sensor(name, {
                 "value": st.value,
                 "ts": st.ts,
@@ -478,7 +488,7 @@ class MainWindow(QMainWindow):
                 "high": st.high,
             })
 
-        # Global status (GUI + API)
+        # Global status + API system status
         if any_alarm:
             self.global_status.setText("System: ALARM")
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ff6b6b;")
@@ -495,7 +505,6 @@ class MainWindow(QMainWindow):
             self.global_status.setText("System: CONNECTING...")
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ffffff;")
             self.api_state.set_system_status("CONNECTING")
-
 
 
 def main():
