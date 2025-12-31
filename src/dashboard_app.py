@@ -37,7 +37,7 @@ import uvicorn
 class SharedApiState:
     def __init__(self):
         self._lock = threading.Lock()
-        self._system_status: str = "CONNECTING"
+        self._system_status: str = "LISTENING"
         self._sensors: Dict[str, Dict[str, Any]] = {}
         self._alarms: List[Dict[str, Any]] = []
 
@@ -122,12 +122,12 @@ class SensorState:
 # =========================
 class DashboardTCPServerWorker(threading.Thread):
     """
-    Dashboard is the TCP server:
+    Dashboard is TCP server:
     - bind() + listen()
-    - accept() a simulator connection
+    - accept() simulator connection
     - read newline-delimited JSON
-    - push parsed dicts into a queue
-    Never touches GUI.
+    - push data + connection events to queue
+    Never touches GUI directly.
     """
     def __init__(self, bind_host: str, bind_port: int, out_queue: queue.Queue, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -135,6 +135,10 @@ class DashboardTCPServerWorker(threading.Thread):
         self.bind_port = bind_port
         self.out_queue = out_queue
         self.stop_event = stop_event
+
+    def _emit_conn(self, state: str) -> None:
+        # control message (handled by GUI thread)
+        self.out_queue.put({"_type": "conn", "state": state})
 
     def run(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -145,6 +149,7 @@ class DashboardTCPServerWorker(threading.Thread):
             server.listen(1)
             server.settimeout(0.5)  # so we can check stop_event periodically
             print(f"[DASH] Listening for simulator on {self.bind_host}:{self.bind_port}")
+            self._emit_conn("LISTENING")
 
             while not self.stop_event.is_set():
                 try:
@@ -155,6 +160,8 @@ class DashboardTCPServerWorker(threading.Thread):
                     break
 
                 print(f"[DASH] Simulator connected from {addr}")
+                self._emit_conn("CONNECTED")
+
                 with conn:
                     conn.settimeout(1.0)
                     f = conn.makefile("r", encoding="utf-8", newline="\n")
@@ -172,11 +179,14 @@ class DashboardTCPServerWorker(threading.Thread):
                                 msg["status"] = str(msg["status"]).upper()
                                 if msg["status"] not in ("OK", "FAULT"):
                                     msg["status"] = "FAULT"
+                                msg["_type"] = "data"
                                 self.out_queue.put(msg)
                         except json.JSONDecodeError:
                             continue
 
-                print("[DASH] Simulator disconnected. Waiting for reconnect...")
+                print("[DASH] Simulator disconnected. Back to listening...")
+                self._emit_conn("DISCONNECTED")
+                self._emit_conn("LISTENING")
 
         finally:
             try:
@@ -195,14 +205,14 @@ class MainWindow(QMainWindow):
 
         cfg = self._load_config(config_path)
 
-        # NOW: these mean dashboard bind host/port (server)
+        # Dashboard binds and listens here
         self.bind_host = cfg["simulator"]["host"]
         self.bind_port = int(cfg["simulator"]["port"])
 
         self.update_hz = float(cfg["ui"]["update_hz"])
         self.plot_window_sec = float(cfg["ui"]["plot_window_sec"])
 
-        # API settings (remote access)
+        # API settings
         self.api_host = cfg.get("api", {}).get("host", "127.0.0.1")
         self.api_port = int(cfg.get("api", {}).get("port", 8000))
 
@@ -216,7 +226,10 @@ class MainWindow(QMainWindow):
                 raise ValueError(f"Duplicate sensor name in config: {name}")
             self.sensors[name] = SensorState(name=name, low=float(s["low"]), high=float(s["high"]))
 
-        # Thread-safe queue (worker -> GUI)
+        # Connection flags (for global status)
+        self.client_connected = False
+        self.has_received_data = False
+
         self.msg_queue: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
 
@@ -239,6 +252,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_timer_tick)
         self.timer.start(interval_ms)
+
+        # Default status
+        self._set_global_status_listening()
 
     def closeEvent(self, event):
         self.stop_event.set()
@@ -281,7 +297,7 @@ class MainWindow(QMainWindow):
         dash = QWidget()
         dash_layout = QVBoxLayout(dash)
 
-        self.global_status = QLabel("System: CONNECTING...")
+        self.global_status = QLabel("System: LISTENING...")
         self.global_status.setAlignment(Qt.AlignCenter)
         self.global_status.setStyleSheet("font-size: 16px; font-weight: bold; padding: 8px;")
         dash_layout.addWidget(self.global_status)
@@ -393,19 +409,84 @@ class MainWindow(QMainWindow):
         # API alarm history
         self.api_state.add_alarm({"time": ts, "sensor": sensor, "value": value, "type": alarm_type})
 
+    def _reset_all_sensors_to_default(self):
+        # Reset internal states
+        for name in self.sensor_names:
+            st = self.sensors[name]
+            st.value = None
+            st.ts = "-"
+            st.status = "N/A"
+            st.in_alarm = False
+            st.t_buf.clear()
+            st.v_buf.clear()
+
+        # Reset UI cells + plots
+        for row, name in enumerate(self.sensor_names):
+            self.table.item(row, 1).setText("-")
+            self.table.item(row, 2).setText("-")
+            self.table.item(row, 3).setText("N/A")
+            self._paint_row(row, bg="#2b2b2b", fg="#ffffff")
+            self._set_status_text_color(row, "#ffffff")
+            self.plot_curves[name].setData([], [])
+
+        # Reset API sensor snapshots too
+        for name in self.sensor_names:
+            st = self.sensors[name]
+            self.api_state.update_sensor(name, {
+                "value": st.value,
+                "ts": st.ts,
+                "status": st.status,
+                "low": st.low,
+                "high": st.high,
+            })
+
+    def _set_global_status_listening(self):
+        self.global_status.setText("System: LISTENING...")
+        self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ffffff;")
+        self.api_state.set_system_status("LISTENING")
+
+    def _set_global_status_connected(self):
+        self.global_status.setText("System: CONNECTED (Waiting for data...)")
+        self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ffffff;")
+        self.api_state.set_system_status("CONNECTED")
+
     def _on_timer_tick(self):
         now_epoch = datetime.now().timestamp()
 
-        # Drain messages
+        # Drain queue (data + connection events)
         while True:
             try:
                 msg = self.msg_queue.get_nowait()
             except queue.Empty:
                 break
 
-            name = msg["sensor"]
+            if msg.get("_type") == "conn":
+                state = msg.get("state", "")
+                if state == "LISTENING":
+                    self.client_connected = False
+                    self.has_received_data = False
+                    self._set_global_status_listening()
+                elif state == "CONNECTED":
+                    self.client_connected = True
+                    self.has_received_data = False
+                    self._set_global_status_connected()
+                elif state == "DISCONNECTED":
+                    # ✅ Your requirement: reset everything to default on disconnect
+                    self.client_connected = False
+                    self.has_received_data = False
+                    self._reset_all_sensors_to_default()
+                    self._set_global_status_listening()
+                continue
+
+            # Data message
+            if msg.get("_type") != "data":
+                continue
+
+            name = msg.get("sensor")
             if name not in self.sensors:
                 continue
+
+            self.has_received_data = True
 
             st = self.sensors[name]
             st.value = float(msg["value"])
@@ -429,6 +510,15 @@ class MainWindow(QMainWindow):
                     st.in_alarm = False
             else:
                 st.in_alarm = False
+
+        # If no client, keep LISTENING (don’t repaint noisy stuff)
+        if not self.client_connected:
+            return
+
+        # If connected but no data yet, keep CONNECTED text
+        if self.client_connected and not self.has_received_data:
+            self._set_global_status_connected()
+            return
 
         # Refresh UI + API snapshots
         any_alarm = False
@@ -468,7 +558,7 @@ class MainWindow(QMainWindow):
                 self._paint_row(row, bg="#2b2b2b", fg="#ffffff")
                 self._set_status_text_color(row, "#ffffff")
 
-            # Plot update (rolling window)
+            # Plot update
             if len(st.t_buf) >= 2:
                 t0 = st.t_buf[-1]
                 xs = [x - t0 for x in st.t_buf]
@@ -488,7 +578,7 @@ class MainWindow(QMainWindow):
                 "high": st.high,
             })
 
-        # Global status + API system status
+        # Global status + API status
         if any_alarm:
             self.global_status.setText("System: ALARM")
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ff6b6b;")
@@ -502,9 +592,7 @@ class MainWindow(QMainWindow):
             self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#4ade80;")
             self.api_state.set_system_status("OK")
         else:
-            self.global_status.setText("System: CONNECTING...")
-            self.global_status.setStyleSheet("font-size:16px; font-weight:bold; padding:8px; color:#ffffff;")
-            self.api_state.set_system_status("CONNECTING")
+            self._set_global_status_connected()
 
 
 def main():
