@@ -1,6 +1,10 @@
 simulator:
   host: "127.0.0.1"
   port: 9000
+  password: "admin123"
+
+maintenance:
+  password: "admin123"
 
 ui:
   update_hz: 5          # GUI refresh rate (>=2Hz). 5Hz feels smooth.
