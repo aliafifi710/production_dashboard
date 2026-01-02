@@ -39,7 +39,14 @@ production_dashboard/
 ```
 ## Setup Steps
 
-### 1) Create and activate virtual environment
+### Clone & Create Virtual Environment
+
+### 1) Clone the repository
+```powershell
+git clone https://github.com/aliafifi710/production_dashboard.git
+cd <REPO_FOLDER_NAME>
+```
+### 2) Create and activate virtual environment
 **Windows (PowerShell):**
 ```powershell
 python -m venv .venv
@@ -57,7 +64,7 @@ python -m venv .venv
 python3 -m venv .venv
 source .venv/bin/activate
 ```
-### 2) Install dependencies
+### 3) Install dependencies
 ```powershell
 pip install -r requirements.txt
 ```
